@@ -6,7 +6,6 @@
 #include "sockaddr_universal.h"
 
 struct tunnel_ctx;
-struct buffer_t;
 
 enum socket_state {
     socket_state_stop,  /* Stopped. */
@@ -35,7 +34,7 @@ struct tunnel_ctx {
     void *data;
     bool terminated;
     bool getaddrinfo_pending;
-    uv_tcp_t *listener;  /* Backlink to owning listener context. */
+    uv_loop_t *loop; /* Backlink to owning loop object. */
     struct socket_ctx *incoming;  /* Connection with the SOCKS client. */
     struct socket_ctx *outgoing;  /* Connection with upstream. */
     struct socks5_address *desired_addr;
@@ -72,7 +71,7 @@ size_t get_fd_tcp_mss(socket_fd fd);
 size_t socket_arrived_data_size(struct socket_ctx *socket, size_t suggested_size);
 
 typedef bool(*tunnel_init_done_cb)(struct tunnel_ctx *tunnel, void *p);
-void tunnel_initialize(uv_tcp_t *lx, unsigned int idle_timeout, tunnel_init_done_cb init_done_cb, void *p);
+struct tunnel_ctx * tunnel_initialize(uv_loop_t *loop, uv_tcp_t *listener, unsigned int idle_timeout, tunnel_init_done_cb init_done_cb, void *p);
 
 void tunnel_add_ref(struct tunnel_ctx *tunnel);
 void tunnel_release(struct tunnel_ctx *tunnel);

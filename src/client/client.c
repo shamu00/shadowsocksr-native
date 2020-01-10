@@ -11,6 +11,7 @@
 #include "tls_cli.h"
 #include "ws_tls_basic.h"
 #include "http_parser_wrapper.h"
+#include "udprelay.h"
 
 /* A connection is modeled as an abstraction on top of two simple state
  * machines, one for reading and one for writing.  Either state machine
@@ -105,9 +106,9 @@ static void tunnel_tls_on_connection_established(struct tunnel_ctx *tunnel);
 static void tunnel_tls_on_data_received(struct tunnel_ctx *tunnel, const uint8_t *data, size_t size);
 static void tunnel_tls_on_shutting_down(struct tunnel_ctx *tunnel);
 
-static bool can_auth_none(const uv_tcp_t *lx, const struct tunnel_ctx *cx);
-static bool can_auth_passwd(const uv_tcp_t *lx, const struct tunnel_ctx *cx);
-static bool can_access(const uv_tcp_t *lx, const struct tunnel_ctx *cx, const struct sockaddr *addr);
+static bool can_auth_none(const struct tunnel_ctx *cx);
+static bool can_auth_passwd(const struct tunnel_ctx *cx);
+static bool can_access(const struct tunnel_ctx *cx, const struct sockaddr *addr);
 
 static void client_tunnel_shutdown(struct tunnel_ctx *tunnel);
 
@@ -148,11 +149,11 @@ static bool init_done_cb(struct tunnel_ctx *tunnel, void *p) {
     return true;
 }
 
-void client_tunnel_initialize(uv_tcp_t *lx, unsigned int idle_timeout) {
+struct tunnel_ctx * client_tunnel_initialize(uv_tcp_t *lx, unsigned int idle_timeout) {
     uv_loop_t *loop = lx->loop;
     struct server_env_t *env = (struct server_env_t *)loop->data;
 
-    tunnel_initialize(lx, idle_timeout, &init_done_cb, env);
+    return tunnel_initialize(loop, lx, idle_timeout, &init_done_cb, env);
 }
 
 static void client_tunnel_shutdown(struct tunnel_ctx *tunnel) {
@@ -310,14 +311,14 @@ static void do_handshake(struct tunnel_ctx *tunnel) {
     }
 
     methods = s5_auth_methods(parser);
-    if ((methods & s5_auth_none) && can_auth_none(tunnel->listener, tunnel)) {
+    if ((methods & s5_auth_none) && can_auth_none(tunnel)) {
         s5_select_auth(parser, s5_auth_none);
         socket_write(incoming, "\5\0", 2);  /* No auth required. */
         ctx->stage = tunnel_stage_handshake_replied;
         return;
     }
 
-    if ((methods & s5_auth_passwd) && can_auth_passwd(tunnel->listener, tunnel)) {
+    if ((methods & s5_auth_passwd) && can_auth_passwd(tunnel)) {
         /* TODO(bnoordhuis) Implement username/password auth. */
         tunnel->tunnel_shutdown(tunnel);
         return;
@@ -405,10 +406,22 @@ static void do_parse_s5_request(struct tunnel_ctx *tunnel) {
 
     if (s5_get_cmd(parser) == s5_cmd_udp_assoc) {
         // UDP ASSOCIATE requests
-        size_t len = incoming->buf->len;
-        uint8_t *buf = build_udp_assoc_package(config->udp, config->listen_host, config->listen_port,
-            (uint8_t *)incoming->buf->base, &len);
+        size_t len = 0;
+        uint8_t *buf;
+
+        union sockaddr_universal sockname;
+        int namelen = sizeof(sockname);
+        char addr[256] = { 0 };
+        uint16_t port = 0;
+
+        VERIFY(0 == uv_tcp_getsockname(&incoming->handle.tcp, (struct sockaddr *)&sockname, &namelen));
+
+        universal_address_to_string(&sockname, addr, sizeof(addr));
+        port = universal_address_get_port(&sockname);
+
+        buf = build_udp_assoc_package(config->udp, addr, port, &malloc, &len);
         socket_write(incoming, buf, len);
+        free(buf);
         ctx->stage = tunnel_stage_s5_udp_accoc;
         return;
     }
@@ -506,7 +519,7 @@ static void do_connect_ssr_server(struct tunnel_ctx *tunnel) {
     ASSERT(outgoing->rdstate == socket_state_stop);
     ASSERT(outgoing->wrstate == socket_state_stop);
 
-    if (!can_access(tunnel->listener, tunnel, &outgoing->addr.addr)) {
+    if (!can_access(tunnel, &outgoing->addr.addr)) {
         pr_warn("connection not allowed by ruleset");
         /* Send a 'Connection not allowed by ruleset' reply. */
         socket_write(incoming, "\5\2\0\1\0\0\0\0\0\0", 10);
@@ -970,15 +983,15 @@ static void tunnel_tls_on_shutting_down(struct tunnel_ctx *tunnel) {
     ctx->original_tunnel_shutdown(tunnel);
 }
 
-static bool can_auth_none(const uv_tcp_t *lx, const struct tunnel_ctx *cx) {
+static bool can_auth_none(const struct tunnel_ctx *cx) {
     return true;
 }
 
-static bool can_auth_passwd(const uv_tcp_t *lx, const struct tunnel_ctx *cx) {
+static bool can_auth_passwd(const struct tunnel_ctx *cx) {
     return false;
 }
 
-static bool can_access(const uv_tcp_t *lx, const struct tunnel_ctx *cx, const struct sockaddr *addr) {
+static bool can_access(const struct tunnel_ctx *cx, const struct sockaddr *addr) {
     const struct sockaddr_in6 *addr6;
     const struct sockaddr_in *addr4;
     const uint32_t *p;
@@ -1014,4 +1027,12 @@ static bool can_access(const uv_tcp_t *lx, const struct tunnel_ctx *cx, const st
     }
 
     return false;
+}
+
+void udp_on_recv_data(struct udp_listener_ctx_t *udp_ctx, const union sockaddr_universal *src_addr, const struct buffer_t *data) {
+    uv_loop_t *loop = udp_relay_context_get_loop(udp_ctx);
+    struct server_env_t *env = (struct server_env_t *)loop->data;
+    struct server_config *config = env->config;
+    struct tunnel_ctx *tunnel = tunnel_initialize(loop, NULL, config->idle_timeout, &init_done_cb, env);
+    do_next(NULL, NULL);
 }

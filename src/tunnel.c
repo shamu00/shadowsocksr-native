@@ -121,6 +121,22 @@ void tunnel_add_ref(struct tunnel_ctx *tunnel) {
 int tunnel_count = 0;
 #endif // SSR_DUMP_TUNNEL_COUNT
 
+struct socket_ctx * socket_context_create(struct tunnel_ctx *tunnel, unsigned int idle_timeout) {
+    struct socket_ctx *ctx = (struct socket_ctx *) calloc(1, sizeof(*ctx));
+    ctx->tunnel = tunnel;
+    ctx->result = 0;
+    ctx->rdstate = socket_state_stop;
+    ctx->wrstate = socket_state_stop;
+    ctx->idle_timeout = idle_timeout;
+    VERIFY(0 == uv_timer_init(tunnel->loop, &ctx->timer_handle));
+    VERIFY(0 == uv_tcp_init(tunnel->loop, &ctx->handle.tcp));
+    return ctx;
+}
+
+void socket_context_release(struct socket_ctx *ctx) {
+    free(ctx);
+}
+
 void tunnel_release(struct tunnel_ctx *tunnel) {
     tunnel->ref_count--;
     ASSERT(tunnel->ref_count >= 0);
@@ -136,9 +152,9 @@ void tunnel_release(struct tunnel_ctx *tunnel) {
     pr_info("==== tunnel destroyed   count %3d ====", --tunnel_count);
 #endif // SSR_DUMP_TUNNEL_COUNT
 
-    free(tunnel->incoming);
+    socket_context_release(tunnel->incoming);
 
-    free(tunnel->outgoing);
+    socket_context_release(tunnel->outgoing);
 
     free(tunnel->desired_addr);
 
@@ -147,42 +163,32 @@ void tunnel_release(struct tunnel_ctx *tunnel) {
 }
 
 /* |incoming| has been initialized by listener.c when this is called. */
-void tunnel_initialize(uv_tcp_t *listener, unsigned int idle_timeout, tunnel_init_done_cb init_done_cb, void *p) {
+struct tunnel_ctx * tunnel_initialize(uv_loop_t *loop, uv_tcp_t *listener, unsigned int idle_timeout, tunnel_init_done_cb init_done_cb, void *p) {
     struct socket_ctx *incoming;
     struct socket_ctx *outgoing;
     struct tunnel_ctx *tunnel;
-    uv_loop_t *loop = listener->loop;
     bool success = false;
 
+    if (listener) {
+        VERIFY(loop == listener->loop);
+    }
 #ifdef SSR_DUMP_TUNNEL_COUNT
     pr_info("==== tunnel created     count %3d ====", ++tunnel_count);
 #endif // SSR_DUMP_TUNNEL_COUNT
 
     tunnel = (struct tunnel_ctx *) calloc(1, sizeof(*tunnel));
 
-    tunnel->listener = listener;
+    tunnel->loop = loop;
     tunnel->ref_count = 0;
     tunnel->desired_addr = (struct socks5_address *)calloc(1, sizeof(struct socks5_address));
 
-    incoming = (struct socket_ctx *) calloc(1, sizeof(*incoming));
-    incoming->tunnel = tunnel;
-    incoming->result = 0;
-    incoming->rdstate = socket_state_stop;
-    incoming->wrstate = socket_state_stop;
-    incoming->idle_timeout = idle_timeout;
-    VERIFY(0 == uv_timer_init(loop, &incoming->timer_handle));
-    VERIFY(0 == uv_tcp_init(loop, &incoming->handle.tcp));
-    VERIFY(0 == uv_accept((uv_stream_t *)listener, &incoming->handle.stream));
+    incoming = socket_context_create(tunnel, idle_timeout);
+    if (listener) {
+        VERIFY(0 == uv_accept((uv_stream_t *)listener, &incoming->handle.stream));
+    }
     tunnel->incoming = incoming;
 
-    outgoing = (struct socket_ctx *) calloc(1, sizeof(*outgoing));
-    outgoing->tunnel = tunnel;
-    outgoing->result = 0;
-    outgoing->rdstate = socket_state_stop;
-    outgoing->wrstate = socket_state_stop;
-    outgoing->idle_timeout = idle_timeout;
-    VERIFY(0 == uv_timer_init(loop, &outgoing->timer_handle));
-    VERIFY(0 == uv_tcp_init(loop, &outgoing->handle.tcp));
+    outgoing = socket_context_create(tunnel, idle_timeout);
     tunnel->outgoing = outgoing;
 
     tunnel->tunnel_shutdown = &tunnel_shutdown;
@@ -194,11 +200,15 @@ void tunnel_initialize(uv_tcp_t *listener, unsigned int idle_timeout, tunnel_ini
     tunnel_add_ref(tunnel);
 
     if (success) {
-        /* Wait for the initial packet. */
-        socket_read(incoming, true);
+        if (listener) {
+            /* Wait for the initial packet. */
+            socket_read(incoming, true);
+        }
     } else {
         tunnel->tunnel_shutdown(tunnel);
+        tunnel = NULL;
     }
+    return tunnel;
 }
 
 static void tunnel_shutdown(struct tunnel_ctx *tunnel) {
@@ -434,7 +444,7 @@ void socket_getaddrinfo(struct socket_ctx *c, const char *hostname) {
     uv_loop_t *loop;
 
     tunnel = c->tunnel;
-    loop = tunnel->listener->loop;
+    loop = tunnel->loop;
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
